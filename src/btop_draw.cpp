@@ -980,6 +980,13 @@ namespace Cpu {
 					continue;
 				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + "GPU";
 				if (gpus.size() > 1) out += rjust(to_string(i), 1 + (gpus.size() > 9));
+				if (gpus[i].asleep) {
+					//? Padded to the box edge, to clear the readings of the previous frame
+					const int label_width = b_width - 5 - (gpus.size() > 1 ? 1 + (gpus.size() > 9) : 0);
+					out += Fx::ub + Theme::c("inactive_fg") + ljust(" inactive", max(label_width, 0));
+					if (cy > b_height - 1) break;
+					continue;
+				}
 				if (gpus[i].supported_functions.gpu_utilization) {
 					out += ' ';
 					if (b_columns > 1) {
@@ -1211,6 +1218,10 @@ namespace Gpu {
 				+ Symbols::title_left_down + Theme::c("title") + Fx::b + "RX:" + Fx::ub + Theme::c("div_line") + Symbols::title_right_down + Symbols::h_line*(b_width/2+b_width%2-9-rx_string.size())
 				+ Symbols::title_left_down + Theme::c("title") + Fx::b + rx_string + Fx::ub + Theme::c("div_line") + Symbols::title_right_down + Symbols::round_right_down;
 		}
+
+		//? Written over the first row, whose meter and temperature would only show placeholders
+		if (gpu.asleep)
+			out += Mv::to(b_y + 1, b_x + 5) + Fx::ub + Theme::c("inactive_fg") + ljust("inactive", max(b_width - 6, 0));
 
 		redraw[index] = false;
 		return out + Fx::reset;

@@ -177,6 +177,9 @@ namespace Gpu {
 
 		gpu_info_supported supported_functions;
 
+		//? Runtime suspended: the readings above are placeholders, so draw the device as inactive
+		bool asleep = false;
+
 		// vector<proc_info> graphics_processes = {}; // TODO
 		// vector<proc_info> compute_processes = {};
 	};

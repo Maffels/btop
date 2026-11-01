@@ -18,6 +18,7 @@ tab-size = 4
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -197,6 +198,11 @@ namespace Gpu {
 
 		struct nvmlUtilization_t {unsigned int gpu, memory;};
 		struct nvmlMemory_t {unsigned long long total, free, used;};
+		struct nvmlPciInfo_t {
+			char busIdLegacy[16];
+			unsigned int domain, bus, device, pciDeviceId, pciSubSystemId;
+			char busId[32];
+		};
 
 		//? Function pointers
 		const char* (*nvmlErrorString)(nvmlReturn_t);
@@ -216,6 +222,7 @@ namespace Gpu {
 		nvmlReturn_t (*nvmlDeviceGetPcieThroughput)(nvmlDevice_t, nvmlPcieUtilCounter_t, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetEncoderUtilization)(nvmlDevice_t, unsigned int*, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetDecoderUtilization)(nvmlDevice_t, unsigned int*, unsigned int*);
+		nvmlReturn_t (*nvmlDeviceGetPciInfo_v3)(nvmlDevice_t, nvmlPciInfo_t*);
 
 		//? Data
 		void* nvml_dl_handle;
@@ -225,6 +232,18 @@ namespace Gpu {
 		template <bool is_init> bool collect(gpu_info* gpus_slice);
 		vector<nvmlDevice_t> devices;
 		unsigned int device_count = 0;
+
+		//? NVML calls wake a runtime suspended GPU, and polling an idle GPU stops it from ever suspending.
+		//? So the power state is read from sysfs first, and polling pauses for a while once the GPU looks idle.
+		constexpr int idle_polls_before_backoff = 5;
+		constexpr std::chrono::seconds backoff_duration{20};
+
+		struct power_watch {
+			std::filesystem::path status_path; // Empty without runtime PM, which keeps polling on as usual
+			int idle_polls = 0;
+			std::chrono::steady_clock::time_point backoff_until{};
+		};
+		vector<power_watch> power_watches;
 	}
 
 	//? AMD data collection
@@ -1303,6 +1322,9 @@ namespace Gpu {
 
             #undef LOAD_SYM
 
+			//? Optional, without it the GPU is polled as usual
+			nvmlDeviceGetPciInfo_v3 = (decltype(nvmlDeviceGetPciInfo_v3))dlsym(nvml_dl_handle, "nvmlDeviceGetPciInfo_v3");
+
 			//? Function calls
 			nvmlReturn_t result = nvmlInit();
     		if (result != NVML_SUCCESS) {
@@ -1321,6 +1343,7 @@ namespace Gpu {
 				devices.resize(device_count);
 				gpus.resize(device_count);
 				gpu_names.resize(device_count);
+				power_watches.resize(device_count);
 
 				initialized = true;
 
@@ -1342,6 +1365,33 @@ namespace Gpu {
 			return !initialized;
 		}
 
+		//? A missing file means a GPU manager hid the device or it is gone, NVML must leave it alone either way
+		static bool is_asleep(const std::filesystem::path& status_path) {
+			return not status_path.empty() and readfile(status_path, "suspended").starts_with("suspend");
+		}
+
+		//? Keep the graphs moving without touching the device
+		static void hold_readings(gpu_info& gpu) {
+			auto hold = [&gpu](deque<long long>& series) {
+				series.push_back(gpu.asleep or series.empty() ? 0 : series.back());
+			};
+			hold(gpu.gpu_percent.at("gpu-totals"));
+			hold(gpu.gpu_percent.at("gpu-vram-totals"));
+			hold(gpu.gpu_percent.at("gpu-pwr-totals"));
+			hold(gpu.mem_utilization_percent);
+
+			if (gpu.asleep) {
+				gpu.gpu_clock_speed = 0;
+				gpu.mem_clock_speed = 0;
+				gpu.pwr_usage = 0;
+				gpu.mem_used = 0;
+				gpu.pcie_tx = 0;
+				gpu.pcie_rx = 0;
+				gpu.encoder_utilization = 0;
+				gpu.decoder_utilization = 0;
+			}
+		}
+
 		template <bool is_init> // collect<1> is called in Nvml::init(), and populates gpus.supported_functions
 		bool collect(gpu_info* gpus_slice) { // raw pointer to vector data, size == device_count
 			if (!initialized) return false;
@@ -1359,6 +1409,16 @@ namespace Gpu {
 						gpus[i].supported_functions = {false, false, false, false, false, false, false, false, false, false};
     					continue;
         			}
+
+					//? Power state, only useful when the device is allowed to runtime suspend
+					nvmlPciInfo_t pci;
+					if (nvmlDeviceGetPciInfo_v3 != nullptr and nvmlDeviceGetPciInfo_v3(devices[i], &pci) == NVML_SUCCESS) {
+						const std::filesystem::path power_dir = fmt::format(
+							"/sys/bus/pci/devices/{:04x}:{:02x}:{:02x}.0/power", pci.domain, pci.bus, pci.device
+						);
+						if (readfile(power_dir / "control").starts_with("auto"))
+							power_watches[i].status_path = power_dir / "runtime_status";
+					}
 
 					//? Device name
 					char name[NVML_DEVICE_NAME_BUFFER_SIZE];
@@ -1389,6 +1449,20 @@ namespace Gpu {
         			if (result != NVML_SUCCESS)
     					Logger::warning("NVML: Failed to get maximum GPU temperature, defaulting to 110°C: {}", nvmlErrorString(result));
     				else gpus[i].temp_max = (long long)temp_max;
+				} else {
+					auto& watch = power_watches[i];
+					gpus_slice[i].asleep = is_asleep(watch.status_path);
+
+					//? Something woke the device if this stops being true, so pick up its load right away
+					if (gpus_slice[i].asleep) {
+						watch.idle_polls = 0;
+						watch.backoff_until = {};
+					}
+
+					if (gpus_slice[i].asleep or std::chrono::steady_clock::now() < watch.backoff_until) {
+						hold_readings(gpus_slice[i]);
+						continue;
+					}
 				}
 
 				//? PCIe link speeds, the data collection takes >=20ms each call so they run on separate threads
@@ -1549,6 +1623,19 @@ namespace Gpu {
 				} else if (gpus_slice[i].supported_functions.pcie_txrx and Config::getB("nvml_measure_pcie_speeds")) {
 					pcie_tx_thread.join();
 					pcie_rx_thread.join();
+				}
+
+				//? Stop polling an idle device for a while, so that it gets the chance to suspend
+				if constexpr(not is_init) {
+					auto& watch = power_watches[i];
+					const bool busy = (gpus_slice[i].supported_functions.gpu_utilization and gpus_slice[i].gpu_percent.at("gpu-totals").back() > 0)
+						or gpus_slice[i].encoder_utilization > 0 or gpus_slice[i].decoder_utilization > 0;
+
+					watch.idle_polls = busy ? 0 : watch.idle_polls + 1;
+					if (not watch.status_path.empty() and watch.idle_polls >= idle_polls_before_backoff) {
+						watch.backoff_until = std::chrono::steady_clock::now() + backoff_duration;
+						watch.idle_polls = idle_polls_before_backoff - 1; // Only one poll between backoffs while it stays idle
+					}
 				}
     		}
 
